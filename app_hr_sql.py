@@ -15,6 +15,91 @@ from langchain_core.output_parsers import StrOutputParser
 from datetime import date, datetime
 import streamlit.components.v1 as components
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
+
+def _normalize_db_url(url: str) -> str:
+    """
+    SQLAlchemy는 'postgresql://'을 선호.
+    (Supabase에서 'postgres://'로 주는 경우가 있어 보정)
+    """
+    if not url:
+        return url
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://") :]
+    return url
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine() -> Engine:
+    """
+    ✅ 안전 패턴 핵심
+    - st.cache_resource로 엔진 1회 생성/재사용
+    - import 시점이 아니라 "처음 DB가 필요할 때" 호출되게 사용
+    - pool_pre_ping로 죽은 커넥션 자동 감지
+    - connect_timeout으로 무한 대기 방지
+    - (권장) sslmode=require (Supabase는 보통 SSL 필요)
+    """
+    db_url = _normalize_db_url(os.getenv("DATABASE_URL", "").strip())
+    if not db_url:
+        raise RuntimeError("DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
+
+    connect_args = {"connect_timeout": 10}
+    # psycopg2에서 SSL 옵션을 DSN에 포함시키는 방식도 있지만,
+    # connect_args로 전달하는 게 가장 단순/안전한 편입니다.
+    connect_args["sslmode"] = os.getenv("DB_SSLMODE", "require")
+
+    engine = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),  # 30분
+        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+        connect_args=connect_args,
+        future=True,
+    )
+    return engine
+
+
+def db_ping(engine: Engine, retries: int = 3, backoff_sec: float = 1.2) -> None:
+    """
+    부팅 시/버튼 실행 시 'DB 연결 살아있나' 빠르게 체크하고 싶을 때.
+    Render free/cold start에서 잠깐 안 붙는 경우가 있어 재시도 포함.
+    """
+    last_err = None
+    for i in range(retries):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("select 1"))
+            return
+        except OperationalError as e:
+            last_err = e
+            time.sleep(backoff_sec * (i + 1))
+    raise last_err
+
+
+def fetch_all(sql: str, params: dict | None = None) -> list[dict]:
+    """
+    SELECT용 헬퍼: dict 리스트로 반환
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        result = conn.execute(text(sql), params or {})
+        rows = result.mappings().all()
+    return [dict(r) for r in rows]
+
+
+def execute(sql: str, params: dict | None = None) -> int:
+    """
+    INSERT/UPDATE/DELETE용 헬퍼: 영향 rowcount 반환
+    """
+    engine = get_engine()
+    with engine.begin() as conn:
+        result = conn.execute(text(sql), params or {})
+    return int(result.rowcount or 0)
+
 # =====================================================
 # 유틸: 메시지 → 턴 구조
 # =====================================================
