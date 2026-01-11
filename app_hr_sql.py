@@ -31,7 +31,7 @@ def _normalize_db_url(url: str) -> str:
     return url
 
 @st.cache_resource(show_spinner=False)
-def get_engine() -> Engine:
+def get_db_engine() -> Engine:
     """
     ✅ 안전 패턴 핵심
     - st.cache_resource로 엔진 1회 생성/재사용
@@ -74,7 +74,6 @@ def db_ping(engine: Engine, retries: int = 3, backoff_sec: float = 1.2) -> None:
             return
         except OperationalError as e:
             last_err = e
-            time.sleep(backoff_sec * (i + 1))
     raise last_err
 
 
@@ -82,7 +81,8 @@ def fetch_all(sql: str, params: dict | None = None) -> list[dict]:
     """
     SELECT용 헬퍼: dict 리스트로 반환
     """
-    engine = get_engine()
+    engine = get_db_engine()
+
     with engine.connect() as conn:
         result = conn.execute(text(sql), params or {})
         rows = result.mappings().all()
@@ -93,7 +93,7 @@ def execute(sql: str, params: dict | None = None) -> int:
     """
     INSERT/UPDATE/DELETE용 헬퍼: 영향 rowcount 반환
     """
-    engine = get_engine()
+    engine = get_db_engine()
     with engine.begin() as conn:
         result = conn.execute(text(sql), params or {})
     return int(result.rowcount or 0)
@@ -320,7 +320,7 @@ def get_google_api_key() -> str | None:
     return os.getenv("GOOGLE_API_KEY")
 
 def get_db_uri() -> str | None:
-    return os.getenv("SUPABASE_DB_URI") or os.getenv("DATABASE_URL")
+    return os.getenv("DATABASE_URL")
 
 api_key = get_google_api_key()
 db_uri = get_db_uri()
@@ -345,7 +345,7 @@ if "YOUR-PASSWORD" in db_uri:
 # 3) 엔진 / 설명기 (스타일 전면 수정)
 # =====================================================
 @st.cache_resource(show_spinner=False)
-def get_engine(_db_uri: str, _api_key: str, _version: str) -> HRTextToSQLEngine:
+def get_hr_engine(_db_uri: str, _api_key: str, _version: str) -> HRTextToSQLEngine:
     return HRTextToSQLEngine(db_uri=_db_uri, api_key=_api_key)
 
 @st.cache_resource(show_spinner=False)
@@ -376,8 +376,7 @@ def get_explainer(_api_key: str):
         | StrOutputParser()
     )
 
-
-engine = get_engine(db_uri, api_key, ENGINE_VERSION)
+#engine = get_engine(db_uri, api_key, ENGINE_VERSION)
 explainer = get_explainer(api_key)
 
 
