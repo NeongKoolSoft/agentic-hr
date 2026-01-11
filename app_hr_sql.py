@@ -30,7 +30,6 @@ def _normalize_db_url(url: str) -> str:
         return "postgresql://" + url[len("postgres://") :]
     return url
 
-
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
     """
