@@ -61,7 +61,6 @@ def get_engine() -> Engine:
     )
     return engine
 
-
 def db_ping(engine: Engine, retries: int = 3, backoff_sec: float = 1.2) -> None:
     """
     부팅 시/버튼 실행 시 'DB 연결 살아있나' 빠르게 체크하고 싶을 때.

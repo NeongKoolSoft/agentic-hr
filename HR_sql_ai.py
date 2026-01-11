@@ -189,6 +189,7 @@ def build_orchestrator(
         namespace="scenario_memory",
     )
 
+
     payroll_scenario = PayrollScenario(memory)
 
     orchestrator = ScenarioOrchestrator(
