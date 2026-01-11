@@ -3,6 +3,7 @@ import uuid
 import re
 import ast
 import os
+
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -12,13 +13,17 @@ from scenario_payroll import ScenarioMemoryManager  # 메모리만 재사용
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
 from datetime import date, datetime
-import streamlit.components.v1 as components
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
+
+# =====================================================
+# DB 엔진(순수 SQLAlchemy) 유틸
+# =====================================================
 def _normalize_db_url(url: str) -> str:
     """
     SQLAlchemy는 'postgresql://'을 선호.
@@ -29,6 +34,7 @@ def _normalize_db_url(url: str) -> str:
     if url.startswith("postgres://"):
         return "postgresql://" + url[len("postgres://") :]
     return url
+
 
 @st.cache_resource(show_spinner=False)
 def get_db_engine() -> Engine:
@@ -45,8 +51,6 @@ def get_db_engine() -> Engine:
         raise RuntimeError("DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
 
     connect_args = {"connect_timeout": 10}
-    # psycopg2에서 SSL 옵션을 DSN에 포함시키는 방식도 있지만,
-    # connect_args로 전달하는 게 가장 단순/안전한 편입니다.
     connect_args["sslmode"] = os.getenv("DB_SSLMODE", "require")
 
     engine = create_engine(
@@ -61,11 +65,14 @@ def get_db_engine() -> Engine:
     )
     return engine
 
+
 def db_ping(engine: Engine, retries: int = 3, backoff_sec: float = 1.2) -> None:
     """
     부팅 시/버튼 실행 시 'DB 연결 살아있나' 빠르게 체크하고 싶을 때.
     Render free/cold start에서 잠깐 안 붙는 경우가 있어 재시도 포함.
     """
+    import time
+
     last_err = None
     for i in range(retries):
         try:
@@ -74,6 +81,7 @@ def db_ping(engine: Engine, retries: int = 3, backoff_sec: float = 1.2) -> None:
             return
         except OperationalError as e:
             last_err = e
+            time.sleep(backoff_sec * (i + 1))
     raise last_err
 
 
@@ -82,7 +90,6 @@ def fetch_all(sql: str, params: dict | None = None) -> list[dict]:
     SELECT용 헬퍼: dict 리스트로 반환
     """
     engine = get_db_engine()
-
     with engine.connect() as conn:
         result = conn.execute(text(sql), params or {})
         rows = result.mappings().all()
@@ -97,6 +104,7 @@ def execute(sql: str, params: dict | None = None) -> int:
     with engine.begin() as conn:
         result = conn.execute(text(sql), params or {})
     return int(result.rowcount or 0)
+
 
 # =====================================================
 # 유틸: 메시지 → 턴 구조
@@ -120,8 +128,10 @@ def build_turns(messages):
             i += 1
     return turns
 
+
 def request_scroll(target_id: str = "result-anchor"):
     st.session_state["_scroll_to_id"] = target_id
+
 
 def run_scroll_if_requested():
     target_id = st.session_state.get("_scroll_to_id")
@@ -144,7 +154,7 @@ def run_scroll_if_requested():
     # 실행 후 제거
     del st.session_state["_scroll_to_id"]
 
-    
+
 def _month_bounds(d: date):
     """d가 속한 달의 [월초, 다음달월초) 반환"""
     month_start = d.replace(day=1)
@@ -180,7 +190,7 @@ def enforce_month_range_sql(sql: str) -> str:
 
     s = pat1.sub(repl1, s)
 
-    # 2) pay_month = 'YYYY-MM-DD'::date  (혹시 이런 형태도 나올 수 있어서)
+    # 2) pay_month = 'YYYY-MM-DD'::date
     pat2 = re.compile(
         r"(pay_month\s*=\s*'(\d{4}-\d{2}-\d{2})'\s*::\s*date)",
         flags=re.IGNORECASE
@@ -193,7 +203,7 @@ def enforce_month_range_sql(sql: str) -> str:
 
     s = pat2.sub(repl2, s)
 
-    # 3) pay_month = DATE('YYYY-MM-DD')  ✅ 지금 네 화면의 케이스
+    # 3) pay_month = DATE('YYYY-MM-DD')
     pat3 = re.compile(
         r"pay_month\s*=\s*DATE\s*\(\s*'(\d{4}-\d{2}-\d{2})'\s*\)",
         flags=re.IGNORECASE
@@ -204,27 +214,9 @@ def enforce_month_range_sql(sql: str) -> str:
         ms, nm = _month_bounds(dt)
         return f"pay_month >= DATE '{ms:%Y-%m-%d}' AND pay_month < DATE '{nm:%Y-%m-%d}'"
 
-    s = pat3.sub(repl3, s)    
+    s = pat3.sub(repl3, s)
 
     return s
-
-
-    # DOM 렌더링 후 스크롤 되도록 약간 딜레이
-    components.html(
-        f"""
-        <script>
-          const targetId = "{target_id}";
-          function doScroll() {{
-            const el = window.parent.document.getElementById(targetId);
-            if (el) {{
-              el.scrollIntoView({{ behavior: "smooth", block: "start" }});
-            }}
-          }}
-          setTimeout(doScroll, 250);
-        </script>
-        """,
-        height=0,
-    )
 
 
 def render_action_chips(suggestions, key_prefix="act"):
@@ -315,12 +307,14 @@ if "scenario_memory" not in st.session_state:
 # ===============================
 # 2) 환경변수 로드
 # ===============================
-
 def get_google_api_key() -> str | None:
     return os.getenv("GOOGLE_API_KEY")
 
+
 def get_db_uri() -> str | None:
+    # 운영에서는 DATABASE_URL 하나만 신뢰
     return os.getenv("DATABASE_URL")
+
 
 api_key = get_google_api_key()
 db_uri = get_db_uri()
@@ -328,29 +322,38 @@ db_uri = get_db_uri()
 # ===============================
 # 3) 환경변수 검증
 # ===============================
-
 if not api_key:
     st.error("❌ GOOGLE_API_KEY가 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
     st.stop()
 
 if not db_uri:
-    st.error("❌ DATABASE_URL(SUPABASE_DB_URI)가 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
+    st.error("❌ DATABASE_URL이 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
     st.stop()
 
 if "YOUR-PASSWORD" in db_uri:
     st.error("❌ DATABASE_URL에 [YOUR-PASSWORD]가 그대로 있습니다.")
     st.stop()
-  
+
+
 # =====================================================
-# 3) 엔진 / 설명기 (스타일 전면 수정)
+# 3) HR/LLM 엔진 + Explainer
 # =====================================================
 @st.cache_resource(show_spinner=False)
 def get_hr_engine(_db_uri: str, _api_key: str, _version: str) -> HRTextToSQLEngine:
     return HRTextToSQLEngine(db_uri=_db_uri, api_key=_api_key)
 
+
+def ensure_hr_engine() -> HRTextToSQLEngine:
+    """
+    ✅ 전역 engine 제거 핵심:
+    - 필요할 때만 가져오고
+    - 캐시는 st.cache_resource가 처리
+    """
+    return get_hr_engine(db_uri, api_key, ENGINE_VERSION)
+
+
 @st.cache_resource(show_spinner=False)
 def get_explainer(_api_key: str):
-    # [수정] 젬마/제미나이 특유의 통찰력 있는 답변 스타일로 프롬프트 고도화
     prompt = ChatPromptTemplate.from_template(
         """당신은 '넝쿨 HR 데이터 에이전트'입니다. 제공된 SQL 결과 데이터를 바탕으로 사용자에게 전문적이고 통찰력 있는 보고를 수행하세요.
 
@@ -371,12 +374,12 @@ def get_explainer(_api_key: str):
         | ChatGoogleGenerativeAI(
             model="gemini-2.0-flash",
             google_api_key=_api_key,
-            temperature=0.2 # 약간의 표현 유연성을 위해 온도를 살짝 높임
+            temperature=0.2
         )
         | StrOutputParser()
     )
 
-#engine = get_engine(db_uri, api_key, ENGINE_VERSION)
+
 explainer = get_explainer(api_key)
 
 
@@ -396,15 +399,9 @@ def _to_rows(result):
 
     if isinstance(result, str):
         s = result.strip()
-
-        # Decimal('123') -> 123
         s = re.sub(r"Decimal\('(-?\d+(?:\.\d+)?)'\)", r"\1", s)
         s = re.sub(r'Decimal\("(-?\d+(?:\.\d+)?)"\)', r"\1", s)
-
-        # UUID('...') 같은 표현이 섞이면 literal_eval이 깨질 수 있어서 텍스트로 남겨두기
-        # UUID('xxx') -> 'xxx'
         s = re.sub(r"UUID\('([0-9a-fA-F-]+)'\)", r"'\1'", s)
-
         s = s.replace("NULL", "None")
 
         try:
@@ -420,10 +417,11 @@ def _to_rows(result):
 
 def exec_sql(sql: str):
     """
-    LLM 없이, 직접 SQL 실행.
-    QuerySQLDatabaseTool은 dict {"query": "..."} 형태.
+    ✅ 전역 engine 제거:
+    - 필요할 때 HR 엔진을 가져와 executor로 실행
     """
-    return engine.executor.invoke({"query": sql})
+    hr = ensure_hr_engine()
+    return hr.executor.invoke({"query": sql})
 
 
 def fmt_won(n):
@@ -438,6 +436,7 @@ def fmt_won(n):
 # =====================================================
 TODAY_Y = 2026
 TODAY_M = 1
+
 
 def extract_period(text: str):
     t = text.strip()
@@ -485,7 +484,6 @@ def extract_date_any(text: str):
     if m:
         return f"__MD__:{int(m.group(1))}:{int(m.group(2))}"
 
-    # "25일 지급" 같은 표현
     m = re.search(r"\b(0?[1-9]|[12]\d|3[01])\s*일\b", t)
     if m:
         return f"__DAY__:{int(m.group(1))}"
@@ -503,27 +501,24 @@ def extract_confirm(text: str):
 
 
 def is_rpc_trigger(text: str):
-    # RPC 단어가 있어도 "조회"면 무조건 RPC 실행으로 몰지 않음
-    return bool(re.search(r"(급여|세금|공제|지급|이체|송금|전표|분개)", text)) and (is_execute_intent(text) or not is_query_intent(text))
+    return bool(re.search(r"(급여|세금|공제|지급|이체|송금|전표|분개)", text)) and (
+        is_execute_intent(text) or not is_query_intent(text)
+    )
 
 
 def is_execute_intent(text: str) -> bool:
-    """'처리/실행/진행' 같은 실행 의도가 명확할 때만 True"""
     t = text.strip()
     return bool(re.search(r"(처리|실행|진행|계산|산정해|돌려|생성해|등록|전표생성|지급해)", t))
 
+
 def is_query_intent(text: str) -> bool:
-    """결과 조회 질문(몇 명/총액/합계/결과/요약 등)"""
     t = text.strip()
     return bool(re.search(r"(몇\s*명|인원|대상|총액|합계|금액|건수|결과|내역|리스트|상세|조회|보여줘)", t))
 
 
-
 def month_to_period_date(period_yyyy_mm: str):
-    # '2026-01' -> '2026-01-01'
     y, m = period_yyyy_mm.split("-")
     return f"{int(y):04d}-{int(m):02d}-01"
-
 
 
 # =====================================================
@@ -577,11 +572,10 @@ def rpc_fetch_lines(run_id: str):
     """
     return exec_sql(sql), sql.strip()
 
+
 def rpc_answer_query_from_refs(ctx: dict, user_text: str):
-    """현재 refs(최근 run_id들) 기준으로 결과 질문에 답변"""
     refs = (ctx or {}).get("refs", {}) or {}
 
-    # 무엇을 묻는지 간단 매칭
     ask_headcount = bool(re.search(r"(인원|몇\s*명|대상)", user_text))
     ask_total_gross = bool(re.search(r"(총\s*급여|총급여|gross)", user_text))
     ask_total_net = bool(re.search(r"(총\s*실지급|실지급|net)", user_text))
@@ -589,13 +583,11 @@ def rpc_answer_query_from_refs(ctx: dict, user_text: str):
     ask_payment_lines = bool(re.search(r"(지급\s*라인|지급\s*내역|지급\s*건수|이체\s*건수)", user_text))
     ask_journal_lines = bool(re.search(r"(전표\s*라인|전표\s*내역|분개\s*내역|전표\s*건수)", user_text))
 
-    # 기본: 급여 질문이면 payroll_run_id를 우선 사용
     payroll_run_id = refs.get("payroll_run_id")
     tax_run_id = refs.get("tax_run_id")
     payment_run_id = refs.get("payment_run_id")
     journal_run_id = refs.get("journal_run_id")
 
-    # 어떤 run을 봐야 하는지 결정(단순 룰)
     target_run_id = payroll_run_id
     if re.search(r"(공제|세금)", user_text) and tax_run_id:
         target_run_id = tax_run_id
@@ -605,18 +597,15 @@ def rpc_answer_query_from_refs(ctx: dict, user_text: str):
         target_run_id = journal_run_id
 
     if not target_run_id:
-        return None  # refs 없으면 처리 불가
+        return None
 
-    # run summary 가져오기
     run_row_res, sql_fetch = rpc_fetch_run(str(target_run_id))
     rr = _to_rows(run_row_res)
     summary = {}
     if rr and isinstance(rr[0], (list, tuple)) and len(rr[0]) >= 7:
         summary = rr[0][6] if isinstance(rr[0][6], dict) else {}
 
-    # 질문별 답변 구성
     if ask_headcount:
-        # 급여 산정 대상 인원은 payroll summary 기준
         base_id = payroll_run_id or target_run_id
         base_res, base_sql = rpc_fetch_run(str(base_id))
         br = _to_rows(base_res)
@@ -651,25 +640,19 @@ def rpc_answer_query_from_refs(ctx: dict, user_text: str):
         cnt = len(rows)
         return {"reply": f"📌 전표 라인 건수: **{cnt}건**", "sqls": [sql_lines]}
 
-    # 기본 fallback: 요약 보여주기
     return {"reply": f"📌 요약: {summary}", "sqls": [sql_fetch]}
-
 
 
 def rpc_run(session_id: str, user_text: str) -> dict:
     ctx = rpc_get_ctx(session_id)
     active = ctx.get("active_scenario") == RPC_ACTIVE
-
-    # confirm 먼저
     confirm = extract_confirm(user_text)
 
-    # 종료 intent
     if re.search(r"(취소|종료|그만|중단|리셋|초기화)", user_text):
         rpc_clear_ctx(session_id)
         return {"handled": True, "reply": "RPC 급여 시나리오를 종료했습니다.", "state": None,
                 "suggestions": [], "artifacts": {"rpc_sqls": []}}
 
-    # 실행모드로 들어왔으면 트리거/의도 판단하지 말고 초기화
     if not active:
         ctx = {
             "active_scenario": RPC_ACTIVE,
@@ -679,7 +662,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
             "history": [],
         }
 
-    # (선택) 실행모드에서도 refs가 있으면 결과질문 즉시 응답 가능
     if is_query_intent(user_text) and confirm is None and ctx.get("refs"):
         q = rpc_answer_query_from_refs(ctx, user_text)
         if q:
@@ -688,13 +670,9 @@ def rpc_run(session_id: str, user_text: str) -> dict:
                     "suggestions": ["전체 프로세스 요약", "시나리오 종료"],
                     "artifacts": {"rpc_sqls": q.get("sqls", [])}}
 
-    # slots merge
     slots = ctx.get("slots", {})
 
-    # ✅ 조회 질문이면(실행/confirm이 아닌 경우) refs 기준으로 바로 답변
-    # - DONE 상태뿐 아니라 진행 중에도 동작
     if is_query_intent(user_text) and not is_execute_intent(user_text) and confirm is None:
-        # refs가 있으면 조회로 응답
         if ctx.get("refs"):
             q = rpc_answer_query_from_refs(ctx, user_text)
             if q:
@@ -716,14 +694,12 @@ def rpc_run(session_id: str, user_text: str) -> dict:
     if scope:
         slots["scope"] = scope
 
-    # 지급일/전표일은 문맥에 따라 저장
     if any_date:
         if re.search(r"(전표|분개|전기)", user_text):
             slots["journal_date_raw"] = any_date
         elif re.search(r"(지급|이체|송금)", user_text):
             slots["pay_date_raw"] = any_date
         else:
-            # ambiguous: 우선 pay_date에 넣고, 전표 단계에서 journal로도 사용 가능하게 함
             slots["pay_date_raw"] = any_date
 
     ctx["slots"] = slots
@@ -741,11 +717,9 @@ def rpc_run(session_id: str, user_text: str) -> dict:
             return f"{int(y):04d}-{int(m):02d}-{dd:02d}"
         return raw
 
-    # state machine
     state = ctx.get("state") or S_PAYROLL
     rpc_sqls = []
 
-    # 공통: period_date
     period_yyyy_mm = slots.get("period")
     scope_val = slots.get("scope")
 
@@ -774,8 +748,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
             }
 
         period_date = month_to_period_date(period_yyyy_mm)
-
-        # 실행
         sql_call = f"select public.rpc_payroll_run('{period_date}'::date, '{scope_val}') as run_id;"
         run_id_res = exec_sql(sql_call)
         rpc_sqls.append(sql_call)
@@ -801,7 +773,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
         ctx["refs"]["payroll_run_id"] = str(run_id)
         ctx["history"].append({"state": S_PAYROLL, "run_id": str(run_id)})
 
-        # summary 조회
         run_row_res, sql_fetch = rpc_fetch_run(str(run_id))
         rpc_sqls.append(sql_fetch)
 
@@ -864,7 +835,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
             }
 
         period_date = month_to_period_date(period_yyyy_mm)
-
         sql_call = f"select public.rpc_tax_run('{period_date}'::date, '{scope_val}', '{payroll_run_id}'::uuid) as run_id;"
         run_id_res = exec_sql(sql_call)
         rpc_sqls.append(sql_call)
@@ -952,7 +922,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
                 "artifacts": {"rpc_sqls": rpc_sqls},
             }
 
-        # Confirm gate
         if confirm is None:
             ctx["state"] = S_PAYMENT
             rpc_set_ctx(session_id, ctx)
@@ -1066,7 +1035,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
                 "artifacts": {"rpc_sqls": rpc_sqls},
             }
 
-        # Confirm gate
         if confirm is None:
             ctx["state"] = S_JOURNAL
             rpc_set_ctx(session_id, ctx)
@@ -1117,7 +1085,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
         if rr and isinstance(rr[0], (list, tuple)) and len(rr[0]) >= 7:
             summary = rr[0][6] if isinstance(rr[0][6], dict) else {}
 
-        # 라인 조회(전표 상세)
         lines_res, sql_lines = rpc_fetch_lines(str(run_id))
         rpc_sqls.append(sql_lines)
 
@@ -1154,7 +1121,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
     # S_DONE
     # -------------------------
     if state == S_DONE:
-        # ✅ DONE에서도 "조회 질문"이면 refs 기반으로 바로 답변
         if is_query_intent(user_text) and not is_execute_intent(user_text) and confirm is None:
             if ctx.get("refs"):
                 q = rpc_answer_query_from_refs(ctx, user_text)
@@ -1168,11 +1134,9 @@ def rpc_run(session_id: str, user_text: str) -> dict:
                         "artifacts": {"rpc_sqls": q.get("sqls", [])},
                     }
 
-        # ✅ 요약을 명시적으로 요청했을 때만 요약 모드로
         if re.search(r"(전체\s*요약|요약\s*보여줘|요약)", user_text) and confirm is None:
             confirm = True
 
-        # 요약을 물어보는 게이트(예/아니오)
         if confirm is None:
             ctx["state"] = S_DONE
             rpc_set_ctx(session_id, ctx)
@@ -1184,7 +1148,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
                 "artifacts": {"rpc_sqls": rpc_sqls},
             }
 
-        # 사용자가 아니오면 종료
         if confirm is False:
             rpc_clear_ctx(session_id)
             return {
@@ -1195,7 +1158,6 @@ def rpc_run(session_id: str, user_text: str) -> dict:
                 "artifacts": {"rpc_sqls": rpc_sqls},
             }
 
-        # confirm True면 요약 출력 후 종료
         refs = ctx.get("refs", {})
         reply = (
             "✅ [RPC] 급여 → 공제 → 지급 → 전표 요약\n"
@@ -1213,14 +1175,19 @@ def rpc_run(session_id: str, user_text: str) -> dict:
             "artifacts": {"rpc_sqls": rpc_sqls},
         }
 
-    # safety fallback
     ctx["state"] = S_PAYROLL
     rpc_set_ctx(session_id, ctx)
-    return {"handled": True, "reply": "상태가 꼬여서 처음 단계로 돌아갑니다. '2026년 1월 전직원 급여 처리'로 시작해줘.", "state": S_PAYROLL, "suggestions": ["2026년 1월 전직원 급여 처리"], "artifacts": {"rpc_sqls": rpc_sqls}}
+    return {
+        "handled": True,
+        "reply": "상태가 꼬여서 처음 단계로 돌아갑니다. '2026년 1월 전직원 급여 처리'로 시작해줘.",
+        "state": S_PAYROLL,
+        "suggestions": ["2026년 1월 전직원 급여 처리"],
+        "artifacts": {"rpc_sqls": rpc_sqls},
+    }
 
 
 # =====================================================
-# 7) 헤더 (공간 줄임)
+# 7) 헤더
 # =====================================================
 st.markdown(
     """
@@ -1258,7 +1225,6 @@ if ctx_rpc and ctx_rpc.get("active_scenario") == RPC_ACTIVE:
         st.success("시나리오가 종료되었습니다.")
         st.rerun()
 
-
 # =====================================================
 # 9) 대표 질문
 # =====================================================
@@ -1290,7 +1256,6 @@ st.divider()
 # =====================================================
 turns = build_turns(st.session_state.messages)
 
-# 마지막으로 SQL(또는 raw_sql)이 포함된 assistant 턴 인덱스 찾기
 last_sql_turn_idx = -1
 for i, t in enumerate(turns):
     a = t.get("assistant") or {}
@@ -1305,19 +1270,12 @@ for i, t in enumerate(turns):
     if t["assistant"]:
         with st.chat_message("assistant"):
             st.markdown(t["assistant"]["content"])
-
-            # ✅ 마지막 SQL이 있는 턴만 펼치기
             expand_this = (i == last_sql_turn_idx)
 
             if t["assistant"].get("sql"):
                 with st.expander("🔎 실행된 SQL", expanded=expand_this):
                     st.code(t["assistant"]["sql"], language="sql")
 
-#            if t["assistant"].get("raw_sql"):
-#                with st.expander("🧪 원본 SQL", expanded=expand_this):
-#                    st.code(t["assistant"]["raw_sql"], language="sql")
-
-# ... turns 렌더링 for문 끝난 직후
 st.markdown('<div id="result-anchor"></div>', unsafe_allow_html=True)
 run_scroll_if_requested()
 
@@ -1342,7 +1300,6 @@ if st.session_state.pending_question:
 elif user_input:
     question = user_input
 
-
 # =====================================================
 # 12) 실행: (RPC 시나리오 우선) → fallback LLM 조회
 # =====================================================
@@ -1358,7 +1315,7 @@ if question:
 
         execute_mode = st.session_state.get("rpc_execute_mode", False)
 
-        # 1) 실행 모드일 때만 RPC 시나리오 진입
+        # 1) 실행 모드: RPC
         if execute_mode:
             out_rpc = rpc_run(st.session_state.session_id, question)
 
@@ -1376,18 +1333,18 @@ if question:
                 answer = "⚠️ 실행 모드입니다. 실행 가능한 명령을 입력해 주세요."
                 st.session_state.action_suggestions = ["시나리오 종료"]
 
-        # 2) 조회 모드 → LLM SQL 조회
+        # 2) 조회 모드: LLM SQL 조회
         else:
-            out = engine.run(question)
+            hr = ensure_hr_engine()  # ✅ 전역 engine 대신 여기서 가져옴
+            out = hr.run(question)
             spinner.empty()
 
             fixed_sql = out.get("fixed_sql") or ""
             raw_sql = out.get("raw_sql")
 
-            # ✅ 월 컬럼(date 박기) 강제 보정
             patched_sql = enforce_month_range_sql(fixed_sql)
 
-            # ✅ 보정된 SQL로 우리가 직접 실행해서 결과를 사용
+            # ✅ 보정된 SQL로 직접 실행
             patched_result = exec_sql(patched_sql)
 
             answer = explainer.invoke({
@@ -1395,7 +1352,6 @@ if question:
                 "result": patched_result
             })
 
-            # 화면에는 "실행된 SQL"에 보정본, "원본 SQL"에는 LLM fixed/raw를 보여주기
             sql_to_show = patched_sql
             raw_sql_to_show = fixed_sql if raw_sql is None else raw_sql
             st.session_state.action_suggestions = []
@@ -1415,8 +1371,5 @@ if question:
         "raw_sql": raw_sql_to_show,
     })
 
-    
-    # ✅ 다음 렌더링에서 결과로 스크롤
     request_scroll("result-anchor")
-
     st.rerun()
