@@ -312,27 +312,35 @@ if "scenario_memory" not in st.session_state:
     st.session_state.scenario_memory = {}
 
 
-# =====================================================
-# 2) secrets 로드
-# =====================================================
-api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
-db_uri  = st.secrets.get("SUPABASE_DB_URI") or os.getenv("SUPABASE_DB_URI")
+# ===============================
+# 2) 환경변수 로드
+# ===============================
 
+def get_google_api_key() -> str | None:
+    return os.getenv("GOOGLE_API_KEY")
 
-if not api_key or not db_uri:
-    st.error(
-        "❌ 환경 설정이 없습니다.\n\n"
-        ".streamlit/secrets.toml 에 다음 값을 설정하세요:\n"
-        "- GOOGLE_API_KEY\n"
-        "- SUPABASE_DB_URI"
-    )
+def get_db_uri() -> str | None:
+    return os.getenv("SUPABASE_DB_URI") or os.getenv("DATABASE_URL")
+
+api_key = get_google_api_key()
+db_uri = get_db_uri()
+
+# ===============================
+# 3) 환경변수 검증
+# ===============================
+
+if not api_key:
+    st.error("❌ GOOGLE_API_KEY가 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
     st.stop()
 
-if "[YOUR-PASSWORD]" in db_uri:
-    st.error("❌ SUPABASE_DB_URI에 [YOUR-PASSWORD]가 그대로 있습니다.")
+if not db_uri:
+    st.error("❌ DATABASE_URL(SUPABASE_DB_URI)가 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
     st.stop()
 
-
+if "YOUR-PASSWORD" in db_uri:
+    st.error("❌ DATABASE_URL에 [YOUR-PASSWORD]가 그대로 있습니다.")
+    st.stop()
+  
 # =====================================================
 # 3) 엔진 / 설명기 (스타일 전면 수정)
 # =====================================================
