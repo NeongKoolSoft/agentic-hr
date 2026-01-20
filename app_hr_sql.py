@@ -312,7 +312,6 @@ def get_google_api_key() -> str | None:
 
 
 def get_db_uri() -> str | None:
-    # 운영에서는 DATABASE_URL 하나만 신뢰
     return os.getenv("SUPABASE_DB_URI")
 
 api_key = get_google_api_key()
