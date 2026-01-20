@@ -273,16 +273,6 @@ st.markdown(
 )
 
 
-def show_center_spinner(text: str = "처리 중..."):
-    return st.markdown(
-        f"""
-        <div class="nk-overlay"></div>
-        <div class="nk-center-spinner">⏳ {text}</div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
 # =====================================================
 # 1) 페이지 설정 / 세션
 # =====================================================
@@ -304,6 +294,16 @@ if "scenario_memory" not in st.session_state:
     st.session_state.scenario_memory = {}
 
 
+def show_center_spinner(text: str = "처리 중..."):
+    return st.markdown(
+        f"""
+        <div class="nk-overlay"></div>
+        <div class="nk-center-spinner">⏳ {text}</div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
 # ===============================
 # 2) 환경변수 로드
 # ===============================
@@ -313,8 +313,7 @@ def get_google_api_key() -> str | None:
 
 def get_db_uri() -> str | None:
     # 운영에서는 DATABASE_URL 하나만 신뢰
-    return os.getenv("DATABASE_URL")
-
+    return os.getenv("SUPABASE_DB_URI")
 
 api_key = get_google_api_key()
 db_uri = get_db_uri()
@@ -351,7 +350,6 @@ def ensure_hr_engine() -> HRTextToSQLEngine:
     """
     return get_hr_engine(db_uri, api_key, ENGINE_VERSION)
 
-
 @st.cache_resource(show_spinner=False)
 def get_explainer(_api_key: str):
     prompt = ChatPromptTemplate.from_template(
@@ -382,6 +380,56 @@ def get_explainer(_api_key: str):
 
 explainer = get_explainer(api_key)
 
+# ... (기존 get_explainer 함수 아래에 추가) ...
+
+@st.cache_resource(show_spinner=False)
+def get_rewriter(_api_key: str):
+    """
+    [대화 맥락 유지 핵심]
+    사용자의 불완전한 질문(예: "그럼 이건?")을 이전 대화 기록을 참고하여
+    '완전한 문장'으로 다시 작성해주는 체인입니다.
+    """
+    prompt = ChatPromptTemplate.from_template(
+        """당신은 사용자의 질문을 데이터베이스 조회를 위한 '완전한 질문'으로 재구성하는 AI입니다.
+        
+        [대화 기록]
+        {history}
+        
+        [현재 질문]
+        {question}
+        
+        위 대화 흐름을 고려하여, [현재 질문]을 SQL 생성이 가능한 '구체적이고 독립적인 질문'으로 다시 작성하세요.
+        - 대명사("그것", "이전 것")가 있다면 명확한 명사로 바꾸세요.
+        - 조건("반대로", "True만")이 변경되었다면 전체 문장에 반영하세요.
+        - 질문의 의도가 바뀌지 않도록 주의하세요.
+        - 설명 없이 오직 '재작성된 질문'만 출력하세요.
+        
+        재작성된 질문:"""
+    )
+    return (
+        prompt
+        | ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash", 
+            google_api_key=_api_key, 
+            temperature=0.1
+        )
+        | StrOutputParser()
+    )
+
+def format_history(messages, limit=6):
+    """
+    세션에 저장된 메시지 중 최근 N개를 텍스트로 변환합니다.
+    """
+    history_text = ""
+    # 너무 오래된 기억은 버리고 최근 3턴(6개) 정도만 참조
+    recent_msgs = messages[-limit:] if len(messages) > limit else messages
+    
+    for msg in recent_msgs:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        content = msg["content"]
+        history_text += f"{role}: {content}\n"
+    
+    return history_text
 
 # =====================================================
 # 4) (RPC 전용) 결과 파서 / SQL 실행 유틸
@@ -1336,7 +1384,23 @@ if question:
         # 2) 조회 모드: LLM SQL 조회
         else:
             hr = ensure_hr_engine()  # ✅ 전역 engine 대신 여기서 가져옴
-            out = hr.run(question)
+            
+            # [Step 1] 질문 재작성 (기억력 주입) 🧠
+            # 대화 기록이 있을 때만 동작합니다.
+            real_question = question
+            if len(st.session_state.messages) > 0:
+                rewriter = get_rewriter(api_key)
+                history_str = format_history(st.session_state.messages[:-1]) # 방금 넣은 질문 제외
+                
+                # "아니, True만 보여줘" -> "야근 여부가 True인 사람만 보여줘" 로 변환
+                real_question = rewriter.invoke({
+                    "history": history_str, 
+                    "question": question
+                })
+                print(f"🔄 Original: {question} -> Rewritten: {real_question}") # 디버깅용 로그
+
+            # [Step 2] 변환된 질문(real_question)으로 SQL 생성
+            out = hr.run(real_question)
             spinner.empty()
 
             fixed_sql = out.get("fixed_sql") or ""
@@ -1347,8 +1411,9 @@ if question:
             # ✅ 보정된 SQL로 직접 실행
             patched_result = exec_sql(patched_sql)
 
+            # [Step 3] 결과 설명 (사용자에게는 원래 질문에 대한 답인 것처럼)
             answer = explainer.invoke({
-                "question": question,
+                "question": real_question, # 설명할 때도 구체적인 질문을 줍니다.
                 "result": patched_result
             })
 
