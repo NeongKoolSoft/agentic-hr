@@ -8,6 +8,7 @@ import streamlit.components.v1 as components
 import time
 import base64
 import fitz  # PyMuPDF
+import hashlib
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -298,61 +299,91 @@ def ensure_korean_font():
 def build_employment_certificate_pdf(emp: dict) -> bytes:
     ensure_korean_font()
 
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
 
-    font_name = "MalgunGothic" if "MalgunGothic" in pdfmetrics.getRegisteredFontNames() else "Helvetica"
-    c.setTitle("재직증명서")
+    FONT = "NotoSansKR"
 
     # 제목
-    c.setFont(font_name, 22)
-    c.drawCentredString(w/2, h - 35*mm, "재 직 증 명 서")
-    c.line(20*mm, h - 40*mm, w - 20*mm, h - 40*mm)
+    c.setFont(FONT, 22)
+    c.drawCentredString(w / 2, h - 35 * mm, "재 직 증 명 서")
+    c.line(20 * mm, h - 40 * mm, w - 20 * mm, h - 40 * mm)
 
-    y = h - 60*mm
-    c.setFont(font_name, 11)
+    y = h - 60 * mm
+    c.setFont(FONT, 12)
 
     def row(label, value):
         nonlocal y
-        c.drawString(30*mm, y, f"{label}")
-        c.drawString(65*mm, y, f"{value}")
-        y -= 10*mm
+        c.drawString(30 * mm, y, label)
+        c.drawString(70 * mm, y, value)
+        y -= 10 * mm
 
     hire = emp.get("hire_date")
     hire_str = hire.strftime("%Y-%m-%d") if isinstance(hire, (date, datetime)) else "-"
 
     row("성명", emp.get("emp_name", "-"))
-    row("사번", emp.get("emp_id", "-"))
+    row("사번", str(emp.get("emp_id", "-")))
     row("부서", emp.get("dept_name", "-"))
     row("직위", emp.get("title", "-"))
     row("입사일", hire_str)
     row("재직상태", "재직 중")
 
-    y -= 8*mm
-    c.drawString(30*mm, y, "위 사람은 현재 당사에 재직 중임을 증명합니다.")
-    y -= 18*mm
+    y -= 10 * mm
+    c.drawString(30 * mm, y, "위 사람은 현재 당사에 재직 중임을 증명합니다.")
 
+    y -= 25 * mm
     today = date.today().strftime("%Y년 %m월 %d일")
-    c.drawRightString(w - 30*mm, y, today)
-    y -= 20*mm
+    c.drawRightString(w - 30 * mm, y, today)
 
-    c.setFont(font_name, 12)
-    c.drawRightString(w - 30*mm, y, "주식회사 넝쿨HR")
-    y -= 8*mm
-    c.setFont(font_name, 10)
-    c.drawRightString(w - 30*mm, y, "대표이사 (인)")
+    y -= 20 * mm
+    c.drawRightString(w - 30 * mm, y, "주식회사 넝쿨HR")
+    c.drawRightString(w - 30 * mm, y - 10, "대표이사 (인)")
 
     c.showPage()
     c.save()
-    return buf.getvalue()
 
+    buffer.seek(0)
+    return buffer.read()
+
+
+FONT_PATH = "assets/fonts/NotoSansKR-Regular.ttf"
+FONT_NAME = "NotoSansKR"
+
+def ensure_korean_font():
+    if FONT_NAME not in pdfmetrics.getRegisteredFontNames():
+        if not os.path.exists(FONT_PATH):
+            raise FileNotFoundError(f"Font not found: {FONT_PATH}")
+        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+
+
+@st.cache_data(show_spinner=False)
+def _render_pdf_page_png(pdf_sha1: str, pdf_bytes: bytes, page_idx: int, zoom: float) -> bytes:
+    # bytes 반환(캐시 친화)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page = doc.load_page(int(page_idx))
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
 
 def pdf_preview(pdf_bytes: bytes, default_zoom: float = 1.4):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_count = doc.page_count
+    if not pdf_bytes:
+        return
 
-    ctrl_col, view_col = st.columns([1, 5])
+    # 캐시 키(바이트 전체를 키로 쓰면 비효율적이라 해시 사용)
+    pdf_sha1 = hashlib.sha1(pdf_bytes).hexdigest()
+
+    # 페이지 수는 캐시 밖에서 1번만 확인
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_count = doc.page_count
+    finally:
+        doc.close()
+
+    ctrl_col, view_col = st.columns([1, 5], vertical_alignment="top")
 
     with ctrl_col:
         st.markdown("#### 🔍 보기 설정")
@@ -362,24 +393,20 @@ def pdf_preview(pdf_bytes: bytes, default_zoom: float = 1.4):
         else:
             page_idx = 0
 
-        zoom = st.slider("확대", 0.8, 3.0, default_zoom, 0.05)
-
+        zoom = st.slider("확대", 0.8, 3.0, float(default_zoom), 0.05)
         fit_to_width = st.toggle("화면에 맞춤", value=True)
-        # 화면에 맞춤 ON이면 폭에 맞춰 보여서 줌이 덜 티남 (대신 읽기 편함)
-        # OFF면 실제 픽셀 크기로 보여서 줌이 확실히 티남
 
-    # PDF -> 이미지 렌더
-    page = doc.load_page(int(page_idx))
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    img = Image.open(BytesIO(pix.tobytes("png")))
+    # PDF -> 이미지 렌더 (캐시 적용)
+    png_bytes = _render_pdf_page_png(pdf_sha1, pdf_bytes, int(page_idx), float(zoom))
+    img = Image.open(BytesIO(png_bytes))
 
     with view_col:
         if fit_to_width:
-            # Streamlit 최신 권장: width="stretch"
-            st.image(img, width="stretch")
+            # ✅ Streamlit에서 가장 안정적인 "폭에 맞춤"
+            st.image(img, use_container_width=True)
         else:
-            # 실제 픽셀 크기 유지: 줌이 확실히 반영됨
-            st.image(img, width="content")
+            # ✅ 원본 픽셀 크기(줌이 확실히 티남)
+            st.image(img, use_container_width=False)
 
 # =====================================================
 # 1) 페이지 설정 / 세션
