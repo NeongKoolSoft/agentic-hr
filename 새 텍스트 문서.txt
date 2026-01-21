@@ -1,0 +1,2 @@
+postgresql://postgres:nkos15648978%21@db.fwsoxupbjdcvertfckbq.supabase.co:5432/postgres
+postgresql://postgres.fwsoxupbjdcvertfckbq:nkos15648978%21@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres

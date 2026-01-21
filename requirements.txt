@@ -83,3 +83,4 @@ watchdog==6.0.0
 websockets==15.0.1
 yarl==1.22.0
 zstandard==0.25.0
+reportlab

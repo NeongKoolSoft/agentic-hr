@@ -3,9 +3,19 @@ import uuid
 import re
 import ast
 import os
-
 import streamlit as st
 import streamlit.components.v1 as components
+import time
+import base64
+import fitz  # PyMuPDF
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+from reportlab.pdfgen import canvas
 
 from HR_sql_ai import HRTextToSQLEngine, ENGINE_VERSION
 from scenario_payroll import ScenarioMemoryManager  # 메모리만 재사용
@@ -46,9 +56,9 @@ def get_db_engine() -> Engine:
     - connect_timeout으로 무한 대기 방지
     - (권장) sslmode=require (Supabase는 보통 SSL 필요)
     """
-    db_url = _normalize_db_url(os.getenv("DATABASE_URL", "").strip())
+    db_url = _normalize_db_url(os.getenv("SUPABASE_DB_URI", "").strip())
     if not db_url:
-        raise RuntimeError("DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
+        raise RuntimeError("SUPABASE_DB_URI 환경변수가 설정되어 있지 않습니다.")
 
     connect_args = {"connect_timeout": 10}
     connect_args["sslmode"] = os.getenv("DB_SSLMODE", "require")
@@ -231,6 +241,184 @@ def render_action_chips(suggestions, key_prefix="act"):
             return label
     return None
 
+def is_employment_cert_trigger(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(re.search(r"(재직\s*증명서|재직증명서|증명서\s*출력|employment\s*certificate)", t, re.IGNORECASE))
+
+def extract_employee_hint(text: str) -> str | None:
+    """
+    사용자가 '김철수 재직증명서'처럼 말하면 힌트를 뽑아 직원 검색에 사용.
+    단순/시연용: 재직증명서/출력/해줘 같은 단어 제거 후 남은 텍스트를 이름 힌트로 사용.
+    """
+    t = (text or "").strip()
+    t = re.sub(r"(재직\s*증명서|재직증명서|증명서\s*출력|출력해|출력해줘|만들어줘|발급해|발급해줘)", "", t)
+    t = t.strip()
+    return t if t else None
+
+def fetch_active_employees(name_hint: str | None = None, limit: int = 50) -> list[dict]:
+    where = """
+    WHERE e.status = 'ACTIVE'
+      AND (e.end_date IS NULL OR e.end_date > CURRENT_DATE)
+    """
+    params = {"limit": limit}
+
+    if name_hint:
+        where += " AND (e.emp_name ILIKE :q OR e.emp_id::text ILIKE :q)"
+        params["q"] = f"%{name_hint}%"
+
+    sql = f"""
+    SELECT
+      e.emp_id,
+      e.emp_name,
+      e.title,
+      e.hire_date,
+      e.email,
+      d.dept_name
+    FROM employees e
+    LEFT JOIN departments d
+      ON d.dept_id = e.dept_id
+    {where}
+    ORDER BY e.emp_name
+    LIMIT :limit;
+    """
+    return fetch_all(sql, params)
+
+# 한글 폰트(선택): 윈도우라면 보통 맑은 고딕 경로를 등록
+def ensure_korean_font():
+    try:
+        pdfmetrics.getFont("MalgunGothic")
+    except Exception:
+        # 윈도우 기본 폰트 경로 (환경에 따라 다를 수 있음)
+        font_path = r"C:\Windows\Fonts\malgun.ttf"
+        if os.path.exists(font_path):
+            pdfmetrics.registerFont(TTFont("MalgunGothic", font_path))
+
+# =====================================================
+# 📄 재직증명서 PDF 생성
+# =====================================================
+def build_employment_certificate_pdf(emp: dict) -> bytes:
+    ensure_korean_font()
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    font_name = "MalgunGothic" if "MalgunGothic" in pdfmetrics.getRegisteredFontNames() else "Helvetica"
+    c.setTitle("재직증명서")
+
+    # 제목
+    c.setFont(font_name, 22)
+    c.drawCentredString(w/2, h - 35*mm, "재 직 증 명 서")
+    c.line(20*mm, h - 40*mm, w - 20*mm, h - 40*mm)
+
+    y = h - 60*mm
+    c.setFont(font_name, 11)
+
+    def row(label, value):
+        nonlocal y
+        c.drawString(30*mm, y, f"{label}")
+        c.drawString(65*mm, y, f"{value}")
+        y -= 10*mm
+
+    hire = emp.get("hire_date")
+    hire_str = hire.strftime("%Y-%m-%d") if isinstance(hire, (date, datetime)) else "-"
+
+    row("성명", emp.get("emp_name", "-"))
+    row("사번", emp.get("emp_id", "-"))
+    row("부서", emp.get("dept_name", "-"))
+    row("직위", emp.get("title", "-"))
+    row("입사일", hire_str)
+    row("재직상태", "재직 중")
+
+    y -= 8*mm
+    c.drawString(30*mm, y, "위 사람은 현재 당사에 재직 중임을 증명합니다.")
+    y -= 18*mm
+
+    today = date.today().strftime("%Y년 %m월 %d일")
+    c.drawRightString(w - 30*mm, y, today)
+    y -= 20*mm
+
+    c.setFont(font_name, 12)
+    c.drawRightString(w - 30*mm, y, "주식회사 넝쿨HR")
+    y -= 8*mm
+    c.setFont(font_name, 10)
+    c.drawRightString(w - 30*mm, y, "대표이사 (인)")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def pdf_preview(pdf_bytes: bytes, default_zoom: float = 1.4):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_count = doc.page_count
+
+    ctrl_col, view_col = st.columns([1, 5])
+
+    with ctrl_col:
+        st.markdown("#### 🔍 보기 설정")
+
+        if page_count > 1:
+            page_idx = st.number_input("페이지", 1, page_count, 1) - 1
+        else:
+            page_idx = 0
+
+        zoom = st.slider("확대", 0.8, 3.0, default_zoom, 0.05)
+
+        fit_to_width = st.toggle("화면에 맞춤", value=True)
+        # 화면에 맞춤 ON이면 폭에 맞춰 보여서 줌이 덜 티남 (대신 읽기 편함)
+        # OFF면 실제 픽셀 크기로 보여서 줌이 확실히 티남
+
+    # PDF -> 이미지 렌더
+    page = doc.load_page(int(page_idx))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.open(BytesIO(pix.tobytes("png")))
+
+    with view_col:
+        if fit_to_width:
+            # Streamlit 최신 권장: width="stretch"
+            st.image(img, width="stretch")
+        else:
+            # 실제 픽셀 크기 유지: 줌이 확실히 반영됨
+            st.image(img, width="content")
+
+# =====================================================
+# 1) 페이지 설정 / 세션
+# =====================================================
+st.set_page_config(page_title="Agentic AI for 넝쿨HR", layout="wide")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+# 시나리오 다음 작업(칩) 저장소
+if "action_suggestions" not in st.session_state:
+    st.session_state.action_suggestions = []
+
+# RPC 시나리오 메모리 namespace
+if "scenario_memory" not in st.session_state:
+    st.session_state.scenario_memory = {}
+
+if "employment_pdf" not in st.session_state:
+    st.session_state.employment_pdf = None
+if "employment_pdf_filename" not in st.session_state:
+    st.session_state.employment_pdf_filename = None
+if "employment_pdf_title" not in st.session_state:
+    st.session_state.employment_pdf_title = None
+
+
+
+def show_center_spinner(text: str = "처리 중..."):
+    return st.markdown(
+        f"""
+        <div class="nk-overlay"></div>
+        <div class="nk-center-spinner">⏳ {text}</div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # =====================================================
 # CSS (상단 공백 제거 + 중앙 로딩 오버레이)
@@ -272,38 +460,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-
-# =====================================================
-# 1) 페이지 설정 / 세션
-# =====================================================
-st.set_page_config(page_title="Agentic AI for 넝쿨HR", layout="wide")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "pending_question" not in st.session_state:
-    st.session_state.pending_question = None
-if "session_id" not in st.session_state:
-    st.session_state.session_id = str(uuid.uuid4())
-
-# 시나리오 다음 작업(칩) 저장소
-if "action_suggestions" not in st.session_state:
-    st.session_state.action_suggestions = []
-
-# RPC 시나리오 메모리 namespace
-if "scenario_memory" not in st.session_state:
-    st.session_state.scenario_memory = {}
-
-
-def show_center_spinner(text: str = "처리 중..."):
-    return st.markdown(
-        f"""
-        <div class="nk-overlay"></div>
-        <div class="nk-center-spinner">⏳ {text}</div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
 # ===============================
 # 2) 환경변수 로드
 # ===============================
@@ -325,11 +481,11 @@ if not api_key:
     st.stop()
 
 if not db_uri:
-    st.error("❌ DATABASE_URL이 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
+    st.error("❌ SUPABASE_DB_URI이 설정되어 있지 않습니다. (Render: Environment Variables 확인)")
     st.stop()
 
 if "YOUR-PASSWORD" in db_uri:
-    st.error("❌ DATABASE_URL에 [YOUR-PASSWORD]가 그대로 있습니다.")
+    st.error("❌ SUPABASE_DB_URI에 [YOUR-PASSWORD]가 그대로 있습니다.")
     st.stop()
 
 
@@ -1348,8 +1504,36 @@ elif user_input:
     question = user_input
 
 # =====================================================
-# 12) 실행: (RPC 시나리오 우선) → fallback LLM 조회
+# 12) 실행: (재직증명서 트리거 우선) → (RPC 실행 모드) → fallback LLM 조회
 # =====================================================
+
+# ✅ (A) 항상 렌더되는 PDF 미리보기 영역 (rerun 후에도 유지)
+if st.session_state.get("employment_pdf"):
+    st.markdown("### 📄 재직증명서 미리보기")
+    st.caption(st.session_state.get("employment_pdf_title") or "")
+
+    pdf_bytes = st.session_state.employment_pdf
+    file_name = st.session_state.get("employment_pdf_filename") or "employment_certificate.pdf"
+
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        st.download_button(
+            "⬇️ PDF 다운로드",
+            data=pdf_bytes,
+            file_name=file_name,
+            mime="application/pdf",
+            use_container_width=True
+        )
+        if st.button("🧹 미리보기 닫기", use_container_width=True, key="close_employment_pdf"):
+            st.session_state.employment_pdf = None
+            st.session_state.employment_pdf_filename = None
+            st.session_state.employment_pdf_title = None
+            st.rerun()
+
+    with col2:
+        pdf_preview(pdf_bytes)
+
+# ✅ (B) 질문 처리
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
 
@@ -1360,9 +1544,61 @@ if question:
     try:
         spinner = show_center_spinner("처리 중...")
 
+        # =====================================================
+        # (0) 📄 재직증명서 트리거 우선 처리
+        # =====================================================
+        if is_employment_cert_trigger(question):
+            spinner.empty()
+
+            name_hint = extract_employee_hint(question)
+            employees = fetch_active_employees(name_hint=name_hint, limit=50)
+
+            if not employees:
+                answer = "❌ 재직 중인 직원을 찾지 못했습니다. 이름/사번을 포함해서 다시 입력해 주세요."
+            else:
+                # ✅ employees dict 키가 emp_name/name 혼재 가능 → 안전 처리
+                options = {
+                    f"{(e.get('emp_name') or e.get('name'))} ({e.get('dept_name','-')}, {e.get('emp_id')})": e
+                    for e in employees
+                }
+
+                if len(options) == 1:
+                    selected = list(options.values())[0]
+                else:
+                    st.info("재직증명서를 발급할 직원을 선택해 주세요.")
+                    label = st.selectbox(
+                        "직원 선택",
+                        list(options.keys()),
+                        key="employment_select"
+                    )
+                    selected = options[label]
+
+                pdf_bytes = build_employment_certificate_pdf(selected)
+                file_name = f"employment_certificate_{selected.get('emp_id','emp')}.pdf"
+                emp_display = selected.get("emp_name") or selected.get("name") or "직원"
+
+                # ✅ rerun 이후에도 보이도록 세션에 저장
+                st.session_state.employment_pdf = pdf_bytes
+                st.session_state.employment_pdf_filename = file_name
+                st.session_state.employment_pdf_title = f"{emp_display} 재직증명서"
+
+                answer = f"📄 **{emp_display}** 님 재직증명서를 생성했습니다. 위 미리보기 영역에서 확인하세요."
+
+            # ✅ 여기서 반드시 종료 (아래 RPC/조회 로직으로 내려가면 안 됨)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+                "sql": None,
+                "raw_sql": None,
+            })
+            request_scroll("result-anchor")
+            st.rerun()
+
+        # =====================================================
+        # (1) 실행 모드: RPC
+        # =====================================================
         execute_mode = st.session_state.get("rpc_execute_mode", False)
 
-        # 1) 실행 모드: RPC
         if execute_mode:
             out_rpc = rpc_run(st.session_state.session_id, question)
 
@@ -1380,25 +1616,23 @@ if question:
                 answer = "⚠️ 실행 모드입니다. 실행 가능한 명령을 입력해 주세요."
                 st.session_state.action_suggestions = ["시나리오 종료"]
 
-        # 2) 조회 모드: LLM SQL 조회
+        # =====================================================
+        # (2) 조회 모드: LLM SQL 조회
+        # =====================================================
         else:
-            hr = ensure_hr_engine()  # ✅ 전역 engine 대신 여기서 가져옴
-            
-            # [Step 1] 질문 재작성 (기억력 주입) 🧠
-            # 대화 기록이 있을 때만 동작합니다.
+            hr = ensure_hr_engine()
+
+            # [Step 1] 질문 재작성 (대화 맥락 반영)
             real_question = question
             if len(st.session_state.messages) > 0:
                 rewriter = get_rewriter(api_key)
-                history_str = format_history(st.session_state.messages[:-1]) # 방금 넣은 질문 제외
-                
-                # "아니, True만 보여줘" -> "야근 여부가 True인 사람만 보여줘" 로 변환
+                history_str = format_history(st.session_state.messages[:-1])  # 방금 넣은 질문 제외
                 real_question = rewriter.invoke({
-                    "history": history_str, 
+                    "history": history_str,
                     "question": question
                 })
-                print(f"🔄 Original: {question} -> Rewritten: {real_question}") # 디버깅용 로그
 
-            # [Step 2] 변환된 질문(real_question)으로 SQL 생성
+            # [Step 2] SQL 생성
             out = hr.run(real_question)
             spinner.empty()
 
@@ -1407,12 +1641,12 @@ if question:
 
             patched_sql = enforce_month_range_sql(fixed_sql)
 
-            # ✅ 보정된 SQL로 직접 실행
+            # [Step 3] SQL 실행
             patched_result = exec_sql(patched_sql)
 
-            # [Step 3] 결과 설명 (사용자에게는 원래 질문에 대한 답인 것처럼)
+            # [Step 4] 설명 생성
             answer = explainer.invoke({
-                "question": real_question, # 설명할 때도 구체적인 질문을 줍니다.
+                "question": real_question,
                 "result": patched_result
             })
 
@@ -1428,6 +1662,7 @@ if question:
         answer = f"❌ 오류: {e}"
         st.session_state.action_suggestions = []
 
+    # ✅ 기본: assistant 메시지 기록 후 rerun
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
@@ -1437,3 +1672,4 @@ if question:
 
     request_scroll("result-anchor")
     st.rerun()
+
