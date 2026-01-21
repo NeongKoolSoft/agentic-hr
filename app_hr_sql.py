@@ -16,7 +16,6 @@ from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 from reportlab.pdfgen import canvas
-
 from HR_sql_ai import HRTextToSQLEngine, ENGINE_VERSION
 from scenario_payroll import ScenarioMemoryManager  # 메모리만 재사용
 
