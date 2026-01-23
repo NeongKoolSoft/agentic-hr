@@ -1021,40 +1021,454 @@ def rpc_run(session_id: str, user_text: str) -> dict:
     # S_PAYROLL
     # -------------------------
     if state == S_PAYROLL:
-        # ... (동작 동일, 내부에 이미 충분한 한글 설명 있음)
-        # ...
-        # (생략)
-        pass  # 실제 내용 아래에서 그대로 펼쳐짐(위치 고정)
+        if not period_yyyy_mm or not scope_val:
+            miss = []
+            if not period_yyyy_mm: miss.append("period(예: 2026년 1월)")
+            if not scope_val: miss.append("scope(예: 전직원/영업부)")
+            reply = (
+                "RPC 급여(프로시저) 실행을 위해 정보가 필요합니다.\n"
+                f"- 누락: {', '.join(miss)}\n"
+                "- 예: '2026년 1월 전직원 급여 처리'\n"
+                "- 예: '1월 영업부 급여 처리'"
+            )
+            ctx["state"] = S_PAYROLL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": reply,
+                "state": ctx["state"],
+                "suggestions": ["2026년 1월 전직원 급여 처리", "이번달 전직원 급여 처리", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        period_date = month_to_period_date(period_yyyy_mm)
+        sql_call = f"select public.rpc_payroll_run('{period_date}'::date, '{scope_val}') as run_id;"
+        run_id_res = exec_sql(sql_call)
+        rpc_sqls.append(sql_call)
+
+        rows = _to_rows(run_id_res)
+        run_id = None
+        if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 1:
+            run_id = rows[0][0]
+        elif rows and isinstance(rows[0], str):
+            run_id = rows[0]
+
+        if not run_id:
+            ctx["state"] = S_PAYROLL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "급여 RPC 호출은 실행했지만 run_id를 파싱하지 못했습니다. (DB 반환값 확인 필요)",
+                "state": ctx["state"],
+                "suggestions": ["다시 시도", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls, "result": run_id_res},
+            }
+
+        ctx["refs"]["payroll_run_id"] = str(run_id)
+        ctx["history"].append({"state": S_PAYROLL, "run_id": str(run_id)})
+
+        run_row_res, sql_fetch = rpc_fetch_run(str(run_id))
+        rpc_sqls.append(sql_fetch)
+
+        rr = _to_rows(run_row_res)
+        summary = {}
+        status = None
+        if rr and isinstance(rr[0], (list, tuple)) and len(rr[0]) >= 7:
+            status = rr[0][4]
+            summary = rr[0][6] if isinstance(rr[0][6], dict) else {}
+
+        ctx["state"] = S_TAX
+        rpc_set_ctx(session_id, ctx)
+
+        reply = (
+            "✅ [RPC] 급여 산정 실행 완료\n"
+            f"- run_id: {run_id}\n"
+        )
+        if summary:
+            reply += (
+                f"- 대상 인원: {summary.get('employee_count')}명\n"
+                f"- 총급여: {fmt_won(summary.get('total_gross'))}\n"
+                f"- 총공제: {fmt_won(summary.get('total_deductions'))}\n"
+                f"- 총실지급: {fmt_won(summary.get('total_net_pay'))}\n"
+            )
+        reply += "\n다음 단계로 **공제 검증(RPC)** 을 진행할까요?"
+
+        return {
+            "handled": True,
+            "reply": reply,
+            "state": ctx["state"],
+            "suggestions": ["공제 검증 진행", "시나리오 종료"],
+            "artifacts": {"rpc_sqls": rpc_sqls, "run_id": str(run_id), "summary": summary, "status": status},
+        }
 
     # -------------------------
     # S_TAX
     # -------------------------
     if state == S_TAX:
-        # ... (동작 동일)
-        pass
+        if not period_yyyy_mm or not scope_val:
+            ctx["state"] = S_PAYROLL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "공제 검증 전에 period/scope가 필요합니다. 예: '2026년 1월 전직원 급여 처리'",
+                "state": ctx["state"],
+                "suggestions": ["2026년 1월 전직원 급여 처리", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        payroll_run_id = ctx["refs"].get("payroll_run_id")
+        if not payroll_run_id:
+            ctx["state"] = S_PAYROLL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "공제 검증 전에 급여 실행(run_id)이 필요합니다. 먼저 '급여 처리'부터 해줘.",
+                "state": ctx["state"],
+                "suggestions": ["급여 처리", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        period_date = month_to_period_date(period_yyyy_mm)
+        sql_call = f"select public.rpc_tax_run('{period_date}'::date, '{scope_val}', '{payroll_run_id}'::uuid) as run_id;"
+        run_id_res = exec_sql(sql_call)
+        rpc_sqls.append(sql_call)
+
+        rows = _to_rows(run_id_res)
+        run_id = rows[0][0] if rows and isinstance(rows[0], (list, tuple)) else None
+
+        ctx["refs"]["tax_run_id"] = str(run_id)
+        ctx["history"].append({"state": S_TAX, "run_id": str(run_id)})
+
+        run_row_res, sql_fetch = rpc_fetch_run(str(run_id))
+        rpc_sqls.append(sql_fetch)
+
+        rr = _to_rows(run_row_res)
+        summary = {}
+        if rr and isinstance(rr[0], (list, tuple)) and len(rr[0]) >= 7:
+            summary = rr[0][6] if isinstance(rr[0][6], dict) else {}
+
+        ctx["state"] = S_PAYMENT
+        rpc_set_ctx(session_id, ctx)
+
+        reply = (
+            "✅ [RPC] 공제 검증 완료\n"
+            f"- run_id: {run_id}\n"
+        )
+        if summary:
+            rate = summary.get("avg_deduction_rate", 0)
+            try:
+                rate_pct = float(rate) * 100.0
+            except Exception:
+                rate_pct = rate
+            reply += (
+                f"- 총급여: {fmt_won(summary.get('total_gross'))}\n"
+                f"- 총공제: {fmt_won(summary.get('total_deductions'))}\n"
+                f"- 총실지급: {fmt_won(summary.get('total_net_pay'))}\n"
+                f"- 평균 공제율: {rate_pct:.2f}%\n"
+                f"- 공제 0원 인원: {summary.get('zero_deduction_count')}명\n"
+            )
+        reply += "\n다음 단계로 **지급 처리(RPC)** 를 진행할까요? 지급일을 입력해줘."
+
+        return {
+            "handled": True,
+            "reply": reply,
+            "state": ctx["state"],
+            "suggestions": ["25일 지급", "2026-01-25 지급", "시나리오 종료"],
+            "artifacts": {"rpc_sqls": rpc_sqls, "run_id": str(run_id), "summary": summary},
+        }
 
     # -------------------------
     # S_PAYMENT
     # -------------------------
     if state == S_PAYMENT:
-        # ... (동작 동일)
-        pass
+        tax_run_id = ctx["refs"].get("tax_run_id")
+        if not tax_run_id:
+            ctx["state"] = S_TAX
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "지급 처리 전에 공제 검증(run_id)이 필요합니다. '공제 검증 진행'을 먼저 해줘.",
+                "state": ctx["state"],
+                "suggestions": ["공제 검증 진행", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if not period_yyyy_mm or not scope_val:
+            ctx["state"] = S_PAYROLL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "지급 처리 전에 period/scope가 필요합니다. '2026년 1월 전직원 급여 처리'부터 진행해줘.",
+                "state": ctx["state"],
+                "suggestions": ["2026년 1월 전직원 급여 처리", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        pay_date = resolve_md(slots.get("pay_date_raw"), period_yyyy_mm)
+        if not pay_date:
+            ctx["state"] = S_PAYMENT
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "지급일이 필요합니다. 예: '25일 지급' 또는 '2026-01-25 지급'",
+                "state": ctx["state"],
+                "suggestions": ["25일 지급", "2026-01-25 지급", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if confirm is None:
+            ctx["state"] = S_PAYMENT
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": (
+                    "지급 실행(배치 생성)을 진행할까요?\n"
+                    f"- period={period_yyyy_mm}\n"
+                    f"- scope={scope_val}\n"
+                    f"- pay_date={pay_date}\n\n"
+                    "예/아니오"
+                ),
+                "state": ctx["state"],
+                "suggestions": ["예", "아니오", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if confirm is False:
+            ctx["state"] = S_PAYMENT
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "지급 실행을 취소했습니다. (계속하려면 '예' 또는 지급일을 다시 입력해줘)",
+                "state": ctx["state"],
+                "suggestions": ["예", "25일 지급", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        period_date = month_to_period_date(period_yyyy_mm)
+        sql_call = (
+            f"select public.rpc_payment_run('{period_date}'::date, '{scope_val}', "
+            f"'{tax_run_id}'::uuid, '{pay_date}'::date) as run_id;"
+        )
+        run_id_res = exec_sql(sql_call)
+        rpc_sqls.append(sql_call)
+
+        rows = _to_rows(run_id_res)
+        run_id = rows[0][0] if rows and isinstance(rows[0], (list, tuple)) else None
+
+        ctx["refs"]["payment_run_id"] = str(run_id)
+        ctx["history"].append({"state": S_PAYMENT, "run_id": str(run_id)})
+
+        run_row_res, sql_fetch = rpc_fetch_run(str(run_id))
+        rpc_sqls.append(sql_fetch)
+
+        rr = _to_rows(run_row_res)
+        summary = {}
+        if rr and isinstance(rr[0], (list, tuple)) and len(rr[0]) >= 7:
+            summary = rr[0][6] if isinstance(rr[0][6], dict) else {}
+
+        ctx["state"] = S_JOURNAL
+        rpc_set_ctx(session_id, ctx)
+
+        reply = (
+            "✅ [RPC] 지급 처리 완료\n"
+            f"- run_id: {run_id}\n"
+        )
+        if summary:
+            reply += (
+                f"- 성공 대상: {summary.get('success_count')}명\n"
+                f"- 오류: {summary.get('error_count')}건\n"
+                f"- 지급총액: {fmt_won(summary.get('pay_total'))}\n"
+                f"- 지급일: {summary.get('pay_date')}\n"
+            )
+        reply += "\n다음 단계로 **전표 생성(RPC)** 을 진행할까요? 전표일을 입력해줘."
+
+        return {
+            "handled": True,
+            "reply": reply,
+            "state": ctx["state"],
+            "suggestions": ["2026-01-31 전표", "1/31 전표", "시나리오 종료"],
+            "artifacts": {"rpc_sqls": rpc_sqls, "run_id": str(run_id), "summary": summary},
+        }
 
     # -------------------------
     # S_JOURNAL
     # -------------------------
     if state == S_JOURNAL:
-        # ... (동작 동일)
-        pass
+        payment_run_id = ctx["refs"].get("payment_run_id")
+        if not payment_run_id:
+            ctx["state"] = S_PAYMENT
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "전표 생성 전에 지급 처리(run_id)가 필요합니다. 먼저 '지급'부터 진행해줘.",
+                "state": ctx["state"],
+                "suggestions": ["25일 지급", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if not period_yyyy_mm or not scope_val:
+            ctx["state"] = S_PAYROLL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "전표 생성 전에 period/scope가 필요합니다. '2026년 1월 전직원 급여 처리'부터 진행해줘.",
+                "state": ctx["state"],
+                "suggestions": ["2026년 1월 전직원 급여 처리", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        journal_date = resolve_md(slots.get("journal_date_raw"), period_yyyy_mm)
+        if not journal_date:
+            ctx["state"] = S_JOURNAL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "전표일이 필요합니다. 예: '2026-01-31 전표' 또는 '1/31 전표'",
+                "state": ctx["state"],
+                "suggestions": ["2026-01-31 전표", "1/31 전표", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if confirm is None:
+            ctx["state"] = S_JOURNAL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": (
+                    "전표 생성을 진행할까요? (전표 초안 생성)\n"
+                    f"- period={period_yyyy_mm}\n"
+                    f"- scope={scope_val}\n"
+                    f"- journal_date={journal_date}\n\n"
+                    "예/아니오"
+                ),
+                "state": ctx["state"],
+                "suggestions": ["예", "아니오", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if confirm is False:
+            ctx["state"] = S_JOURNAL
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "전표 생성을 취소했습니다. (계속하려면 '예' 또는 전표일을 다시 입력해줘)",
+                "state": ctx["state"],
+                "suggestions": ["예", "2026-01-31 전표", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        period_date = month_to_period_date(period_yyyy_mm)
+        sql_call = (
+            f"select public.rpc_journal_post('{period_date}'::date, '{scope_val}', "
+            f"'{payment_run_id}'::uuid, '{journal_date}'::date) as run_id;"
+        )
+        run_id_res = exec_sql(sql_call)
+        rpc_sqls.append(sql_call)
+
+        rows = _to_rows(run_id_res)
+        run_id = rows[0][0] if rows and isinstance(rows[0], (list, tuple)) else None
+
+        ctx["refs"]["journal_run_id"] = str(run_id)
+        ctx["history"].append({"state": S_JOURNAL, "run_id": str(run_id)})
+
+        run_row_res, sql_fetch = rpc_fetch_run(str(run_id))
+        rpc_sqls.append(sql_fetch)
+
+        rr = _to_rows(run_row_res)
+        summary = {}
+        if rr and isinstance(rr[0], (list, tuple)) and len(rr[0]) >= 7:
+            summary = rr[0][6] if isinstance(rr[0][6], dict) else {}
+
+        lines_res, sql_lines = rpc_fetch_lines(str(run_id))
+        rpc_sqls.append(sql_lines)
+
+        ctx["state"] = S_DONE
+        rpc_set_ctx(session_id, ctx)
+
+        reply = (
+            "✅ [RPC] 전표 생성 완료(초안)\n"
+            f"- run_id: {run_id}\n"
+        )
+        if summary:
+            reply += (
+                f"- 차변 합계: {fmt_won(summary.get('debit_total'))}\n"
+                f"- 대변 합계: {fmt_won(summary.get('credit_total'))}\n"
+                f"- 차대일치: {summary.get('balanced')}\n"
+                f"- 전표일: {summary.get('journal_date')}\n"
+            )
+        reply += "\n전체 프로세스 요약을 보여드릴까요? (예/아니오)"
+
+        return {
+            "handled": True,
+            "reply": reply,
+            "state": ctx["state"],
+            "suggestions": ["예", "아니오", "시나리오 종료"],
+            "artifacts": {
+                "rpc_sqls": rpc_sqls,
+                "run_id": str(run_id),
+                "summary": summary,
+                "lines_result": lines_res,
+            },
+        }
 
     # -------------------------
     # S_DONE
     # -------------------------
     if state == S_DONE:
-        # ... (동작 동일)
-        pass
+        if is_query_intent(user_text) and not is_execute_intent(user_text) and confirm is None:
+            if ctx.get("refs"):
+                q = rpc_answer_query_from_refs(ctx, user_text)
+                if q:
+                    rpc_set_ctx(session_id, ctx)
+                    return {
+                        "handled": True,
+                        "reply": q["reply"],
+                        "state": ctx.get("state"),
+                        "suggestions": ["전체 프로세스 요약", "시나리오 종료"],
+                        "artifacts": {"rpc_sqls": q.get("sqls", [])},
+                    }
 
-    # 이상 케이스(꼬일 때) 처음 단계로 복구
+        if re.search(r"(전체\s*요약|요약\s*보여줘|요약)", user_text) and confirm is None:
+            confirm = True
+
+        if confirm is None:
+            ctx["state"] = S_DONE
+            rpc_set_ctx(session_id, ctx)
+            return {
+                "handled": True,
+                "reply": "전체 프로세스 요약을 보여드릴까요? (예/아니오)",
+                "state": ctx["state"],
+                "suggestions": ["예", "아니오", "시나리오 종료"],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        if confirm is False:
+            rpc_clear_ctx(session_id)
+            return {
+                "handled": True,
+                "reply": "알겠습니다. RPC 시나리오를 종료했습니다.",
+                "state": None,
+                "suggestions": [],
+                "artifacts": {"rpc_sqls": rpc_sqls},
+            }
+
+        refs = ctx.get("refs", {})
+        reply = (
+            "✅ [RPC] 급여 → 공제 → 지급 → 전표 요약\n"
+            f"- payroll_run_id: {refs.get('payroll_run_id')}\n"
+            f"- tax_run_id: {refs.get('tax_run_id')}\n"
+            f"- payment_run_id: {refs.get('payment_run_id')}\n"
+            f"- journal_run_id: {refs.get('journal_run_id')}\n"
+        )
+        rpc_clear_ctx(session_id)
+        return {
+            "handled": True,
+            "reply": reply,
+            "state": None,
+            "suggestions": [],
+            "artifacts": {"rpc_sqls": rpc_sqls},
+        }
+
     ctx["state"] = S_PAYROLL
     rpc_set_ctx(session_id, ctx)
     return {
