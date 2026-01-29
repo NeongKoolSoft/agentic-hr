@@ -10,6 +10,7 @@ import time
 import base64
 import fitz  # PyMuPDF
 import hashlib
+import json
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -30,6 +31,25 @@ from datetime import date, datetime
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
+
+
+# =====================================================
+# 🔧 LLM 전역 설정 (모델 교체 대비)
+# =====================================================
+
+LLM_MODELS = {
+    "FAST": {
+        "model": "gemini-2.0-flash",
+        "temperature": 0.0,
+    },
+    "REASONING": {
+        "model": "gemini-2.0-flash",  # ← 3월 이후 여기만 바꾸면 됨
+        "temperature": 0.2,
+    }
+}
+
+LLM_TIMEOUT = 30
+LLM_MAX_RETRIES = 2
 
 
 # =====================================================
@@ -601,6 +621,117 @@ def get_rewriter(_api_key: str):
         | StrOutputParser()
     )
 
+@st.cache_resource(show_spinner=False)
+def get_decision_classifier(_api_key: str):
+    prompt = ChatPromptTemplate.from_template(
+        """
+You are an HR Decision Type Classifier.
+
+Your task is to classify the user's question into one of:
+- DATA_QUERY: asking only for information or facts
+- DECISION: asking whether an action should be taken
+- MIXED: asking for data AND what decision/action to take
+
+IMPORTANT RULES:
+- Questions that ask whether something should be done
+  (e.g. "해야 할까", "뽑아야 할까", "늘려야 할까", "줄여야 할까", "필요할까")
+  MUST be classified as DECISION.
+- Requests for advice, judgment, recommendation, or evaluation are DECISION.
+- Only pure requests for data, lists, or numbers are DATA_QUERY.
+
+HR Decision Types (use only when intent is DECISION or MIXED):
+- STAFFING
+- WORKLOAD
+- COMPENSATION
+- PERFORMANCE
+- LEAVE
+- ORG_STRUCTURE
+- POLICY
+
+Output MUST be a JSON object with exactly these keys:
+{{
+  "intent": "DATA_QUERY | DECISION | MIXED",
+  "decision_type": "STAFFING | WORKLOAD | COMPENSATION | PERFORMANCE | LEAVE | ORG_STRUCTURE | POLICY | null"
+}}
+
+Examples:
+
+Input: 마케팅팀 인원 더 뽑아야 할까?
+Output:
+{{
+  "intent": "DECISION",
+  "decision_type": "STAFFING"
+}}
+
+Input: 요즘 야근이 너무 많은 것 같아
+Output:
+{{
+  "intent": "DECISION",
+  "decision_type": "WORKLOAD"
+}}
+
+Input: 이번 달 부서별 평균 근무시간은?
+Output:
+{{
+  "intent": "DATA_QUERY",
+  "decision_type": null
+}}
+
+Now classify the following input.
+
+Input: {question}
+"""
+    )
+
+    return (
+        prompt
+        | ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            google_api_key=_api_key,
+            temperature=0.0
+        )
+        | StrOutputParser()
+    )
+
+
+DECISION_ACTION_TEMPLATES = {
+    "STAFFING": [
+        "현재 인원 현황 보여줘",
+        "최근 3개월 업무량 추이 보여줘",
+        "최근 이직률 높은 팀은?"
+    ],
+    "WORKLOAD": [
+        "부서별 평균 근무시간 보여줘",
+        "야근 많은 팀 TOP 5",
+        "최근 한달 업무량 변화는?"
+    ],
+    "COMPENSATION": [
+        "직급별 평균 연봉 보여줘",
+        "최근 이직자 보상 수준은?",
+        "팀별 연봉 편차 보여줘"
+    ],
+    "PERFORMANCE": [
+        "팀별 성과 지표 요약해줘",
+        "성과 낮은 팀은 어디야?",
+        "최근 평가 결과 분포는?"
+    ],
+    "LEAVE": [
+        "부서별 휴가 사용률 보여줘",
+        "휴가 사용 적은 팀은?",
+        "승인 대기 중인 휴가 요청은?"
+    ],
+    "ORG_STRUCTURE": [
+        "팀별 인원 구성 보여줘",
+        "관리자 1인당 인원수는?",
+        "조직 구조 요약해줘"
+    ],
+    "POLICY": [
+        "현재 HR 정책 목록 보여줘",
+        "최근 정책 변경 이력은?",
+        "정책별 적용 대상은?"
+    ]
+}
+
 def format_history(messages, limit=6):
     """
     세션에 저장된 메시지 중 최근 N개를 user/assistant 구분과 함께 텍스트로 변환(이상형 대화 이력 string).
@@ -656,6 +787,27 @@ def exec_sql(sql: str):
     """
     hr = ensure_hr_engine()
     return hr.executor.invoke({"query": sql})
+
+
+def classify_decision(question: str) -> dict:
+    classifier = get_decision_classifier(api_key)
+
+    raw = classifier.invoke({"question": question})
+
+    # markdown fence 제거
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        return {
+            "intent": "DATA_QUERY",
+            "decision_type": None,
+            "error": str(e),
+            "raw": raw
+        }
 
 
 def fmt_won(n):
@@ -1678,6 +1830,37 @@ if question:
     # user 메시지 기록
     st.session_state.messages.append({"role": "user", "content": question})
 
+    # =====================================================
+    # (0.5) 🧠 Decision Type Classifier
+    # =====================================================
+    decision_notice = None
+    decision_actions = []
+
+    decision = classify_decision(question)
+    intent = decision.get("intent")
+    decision_type = decision.get("decision_type")
+
+    execute_mode = st.session_state.get("rpc_execute_mode", False)
+
+    if intent == "DECISION" and not execute_mode:
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": (
+                f"🧠 이 질문은 **{decision_type} 관련 의사결정**으로 인식했어요.\n\n"
+                "바로 결론을 내리기보다는, 판단에 필요한 근거부터 확인해볼게요."
+            )
+        })
+
+        st.session_state.action_suggestions = (
+            DECISION_ACTION_TEMPLATES.get(decision_type, [])
+        )
+
+        request_scroll("result-anchor")
+        st.rerun()   # 🔥 핵심: rerun으로 렌더링 트리거
+
+    # =====================================================
+    # 결과 변수 초기화
+    # =====================================================
     answer = ""
     sql_to_show = None
     raw_sql_to_show = None
@@ -1704,34 +1887,23 @@ if question:
                     selected = list(options.values())[0]
                 else:
                     st.info("재직증명서를 발급할 직원을 선택해 주세요.")
-                    label = st.selectbox(
-                        "직원 선택",
-                        list(options.keys()),
-                        key="employment_select"
-                    )
+                    label = st.selectbox("직원 선택", list(options.keys()), key="employment_select")
                     selected = options[label]
 
                 with st.spinner("재직증명서 PDF 생성 중..."):
                     pdf_bytes = build_employment_certificate_pdf(selected)
-                file_name = f"employment_certificate_{selected.get('emp_id','emp')}.pdf"
-                emp_display = selected.get("emp_name") or selected.get("name") or "직원"
 
-                # PDF를 임시 파일로 저장하고 경로 기록
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", prefix="employment_", dir=None) as tmpf:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpf:
                     tmpf.write(pdf_bytes)
                     file_path_to_save = tmpf.name
 
-                answer = f"📄 **{emp_display}** 님 재직증명서를 생성했습니다. 아래 첨부파일(expander)에서 확인하세요."
+                emp_display = selected.get("emp_name") or "직원"
+                answer = f"📄 **{emp_display}** 님 재직증명서를 생성했습니다. 아래에서 확인하세요."
 
-            # assistant 메시지 push 및 첨부파일 경로 저장
-            msg = {
-                "role": "assistant",
-                "content": answer,
-                "sql": None,
-                "raw_sql": None,
-            }
+            msg = {"role": "assistant", "content": answer}
             if file_path_to_save:
                 msg["file_path"] = file_path_to_save
+
             st.session_state.messages.append(msg)
             request_scroll("result-anchor")
             st.rerun()
@@ -1739,23 +1911,16 @@ if question:
         # =====================================================
         # (1) 실행 모드: RPC
         # =====================================================
-        execute_mode = st.session_state.get("rpc_execute_mode", False)
-
         if execute_mode:
             with st.spinner("처리 중..."):
                 out_rpc = rpc_run(st.session_state.session_id, question)
 
-            if out_rpc.get("handled"):
-                answer = out_rpc.get("reply", "")
-                st.session_state.action_suggestions = out_rpc.get("suggestions", []) or []
+            answer = out_rpc.get("reply", "")
+            st.session_state.action_suggestions = out_rpc.get("suggestions", []) or []
 
-                rpc_sqls = (out_rpc.get("artifacts", {}) or {}).get("rpc_sqls", []) or []
-                if rpc_sqls:
-                    sql_to_show = "\n\n".join(s.strip() for s in rpc_sqls)
-
-            else:
-                answer = "⚠️ 실행 모드입니다. 실행 가능한 명령을 입력해 주세요."
-                st.session_state.action_suggestions = ["시나리오 종료"]
+            rpc_sqls = (out_rpc.get("artifacts", {}) or {}).get("rpc_sqls", [])
+            if rpc_sqls:
+                sql_to_show = "\n\n".join(s.strip() for s in rpc_sqls)
 
         # =====================================================
         # (2) 조회 모드: LLM SQL 조회
@@ -1764,9 +1929,8 @@ if question:
             with st.spinner("처리 중... (질문 해석 → SQL 생성 → 실행 → 요약)"):
                 hr = ensure_hr_engine()
 
-                # [Step 1] 질문 맥락 보정(대화 재작성): 히스토리 포함 LLM 프롬프트 이용
                 real_question = question
-                if len(st.session_state.messages) > 0:
+                if len(st.session_state.messages) > 1:
                     rewriter = get_rewriter(api_key)
                     history_str = format_history(st.session_state.messages[:-1])
                     real_question = rewriter.invoke({
@@ -1774,38 +1938,42 @@ if question:
                         "question": question
                     })
 
-                # [Step 2] SQL 생성(gemini) 및 프리/포스트 패치
                 out = hr.run(real_question)
                 fixed_sql = out.get("fixed_sql") or ""
                 raw_sql = out.get("raw_sql")
 
                 patched_sql = enforce_month_range_sql(fixed_sql)
-
-                # [Step 3] SQL 실행
                 patched_result = exec_sql(patched_sql)
 
-                # [Step 4] 실행 결과에 대한 LLM 요약/해설 생성
-                answer = explainer.invoke({
+                answer_body = explainer.invoke({
                     "question": real_question,
                     "result": patched_result
                 })
 
+                if decision_notice:
+                    answer = decision_notice + answer_body
+                    st.session_state.action_suggestions = decision_actions
+                else:
+                    answer = answer_body
+                    st.session_state.action_suggestions = []
+
                 sql_to_show = patched_sql
                 raw_sql_to_show = fixed_sql if raw_sql is None else raw_sql
-                st.session_state.action_suggestions = []
 
     except Exception as e:
         answer = f"❌ 오류: {e}"
         st.session_state.action_suggestions = []
 
-    # assistant 메시지 (SQL 등 결과 포함) 히스토리에 저장 후 페이지 rerun
-    msg = {
+    # =====================================================
+    # assistant 메시지 최종 1회 append
+    # =====================================================
+    st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
         "sql": sql_to_show,
         "raw_sql": raw_sql_to_show,
-    }
-    st.session_state.messages.append(msg)
+    })
 
     request_scroll("result-anchor")
     st.rerun()
+
